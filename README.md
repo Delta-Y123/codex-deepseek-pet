@@ -12,6 +12,19 @@
 
 **状态灯**：🟢 工作中　⚪ 休息中　🔴 未运行
 
+## 下载 / 快速开始
+
+不想自己打包的话，直接下 [Releases](https://github.com/Delta-Y123/codex-deepseek-pet/releases/latest)
+里的 **`CodexDeepSeekPet.exe`** —— Windows x64 单文件，**不需要装 Python**。
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
+```
+
+上面这条会把 exe 装到 `%LOCALAPPDATA%\Programs\CodexDeepSeekPet\`，
+并创建开始菜单 / 桌面 / 开机启动三个快捷方式。装完直接开始工作，无需配置。
+（源码运行：`python desktop_pet.py`，依赖 Pillow + pystray。）
+
 ## 渲染方式（重要）
 
 整幅画面由 **Pillow 绘制**（`ImageFont` + `ImageDraw`，灰度抗锯齿），不再用 Tk 画文字。
