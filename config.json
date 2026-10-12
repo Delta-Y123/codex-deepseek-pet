@@ -1,0 +1,22 @@
+{
+  "refresh_seconds": 10,
+  "position": "bottom-right",
+  "visible": true,
+  "show_panel": false,
+  "show_model": true,
+  "always_on_top": true,
+  "pricing": {
+    "codex": {
+      "currency": "USD",
+      "input_per_1m": 1.25,
+      "cached_input_per_1m": 0.125,
+      "output_per_1m": 10.0
+    },
+    "dsh": {
+      "currency": "CNY",
+      "input_per_1m": 2.0,
+      "cached_input_per_1m": 0.5,
+      "output_per_1m": 8.0
+    }
+  }
+}

@@ -1,0 +1,12 @@
+# 构建产物
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# 运行时生成
+pet.log
+.pet_state.json
