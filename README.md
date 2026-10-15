@@ -1,16 +1,22 @@
 # Codex + DeepSeek Harness 桌面宠物
 
 一个 Windows 悬浮小挂件：把 **OpenAI Codex** 和 **DeepSeek Harness** 两个 AI 编程工具
-的用量、额度和花费并排放在桌面指定角落里，两行、透明背景、几乎不占地方。
+的用量、额度和花费并排放在桌面右下角，两行、透明背景、几乎不占地方。
 
 ![预览](preview.png)
 
 ```
-● Codex     gpt-5.6-sol   5h 100% · 7d 99%     0 tok · $0.00
-● DeepSeek  v4-pro        余额 ¥6.90          62.3M tok · ¥23.35
+● Codex     gpt-6-astra   5h 91% · 7d 99%      332.1K tok · $0.63
+● DeepSeek  v4-pro        余额 ¥28.12          62.3M tok · ¥23.35
 ```
 
 **状态灯**：🟢 工作中　⚪ 休息中　🔴 未运行
+
+判定方式和刷新节奏同步，不再是固定 15 分钟：
+
+- 判据有两条，取"最近"的一条 —— ① **指标还在变**（Token / 费用 / 余额 / 配额任一与上一轮不同）；
+  ② 工具自报的最近活动时间（Codex 线程 `updatedAt` / DSH 会话缓存 mtime）还很近。
+- 窗口 = **3 个刷新周期，下限 60s、上限 300s**：刷新间隔调快，灯也更灵敏。
 
 ## 下载 / 快速开始
 
@@ -60,8 +66,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 - **Codex**：`account/rateLimits/read`（5h = `primary` 300 分钟窗口，7d = `secondary`
   10080 分钟窗口）、`account/usage/read`（每日用量桶、逐线程 `estimatedUsageUsdMicros`），
   与 Codex 官方界面 / VS Code 扩展同源。
-- **DeepSeek**：余额读 `platform.deepseek.com/api/v0/users/get_user_summary`；Token 取自
-  `~/.dsh/storages/session_projcache` 中**今天创建的会话**。
+  这两个账户级接口走网络、各要 5~8 秒，所以改成**后台线程按 30s 轮询**，
+  界面刷新只读最新结果（实测采集耗时从 52s 降到 1.6s）；
+  逐线程账单按 `(threadId, updatedAt)` 缓存，并设 8s 时间预算。
+- **DeepSeek**：余额读 `platform.deepseek.com/api/v0/users/get_user_summary`，
+  **显示的余额 = 普通余额 + 赠金余额**（`normal_wallets` + `bonus_wallets`，赠金一次查询就有，
+  不算额外开销）；Token 取自 `~/.dsh/storages/session_projcache` 中**今天创建的会话**。
 - 模型名会自动去掉与显示名重复的部分（`deepseek-v4-pro` → `v4-pro`）。
 - **只显示实时数据**：不读任何历史快照文件；某轮失败时沿用上一轮的实时结果。
 - 标注 `(估)` 的费用按 `config.json` 单价估算。
@@ -123,4 +133,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1
 
 - 每次刷新只重绘一张 Pillow 图并替换 `PhotoImage`，**不会闪烁**。
 - Codex 侧常驻一个 `codex app-server` 子进程做本地 JSON-RPC（官方客户端同做法），
-  退出时自动关闭，不残留进程。
+  由独立线程轮询，退出时自动关闭，不残留进程。
+- 界面刷新耗时约 1.6s（本地读 + 一次余额 HTTP），与 Codex 的网络开销完全解耦。

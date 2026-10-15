@@ -5,7 +5,7 @@ Codex + DeepSeek Harness 桌面宠物（极简两行 · 透明背景 · 托盘�
     ● Codex     gpt-5.6-sol   5h 100% · 7d 99%    0 tok · $0.00
     ● DeepSeek  v4-pro        余额 ¥7.60         41.8M tok · ¥23.35
 
-· 状态灯：绿=工作中，灰=休息中，红=未运行
+· 状态灯：绿=工作中，灰=休息中，红=未运行（判据与刷新节奏同步，默认 3 个刷新周期）
 · 背景完全透明；文字 #FFFFFF + 纯黑描边
 · 全部画面用 Pillow 灰度抗锯齿绘制（不使用 GDI ClearType），
   因此不会出现次像素彩边（之前那条"紫边"的来源）
@@ -225,6 +225,10 @@ def find_codex_exe():
     return None
 
 
+CODEX_POLL_SECONDS = 30       # 后台抓取 Codex 的间隔（这些接口走网络，慢）
+CODEX_THREAD_BUDGET = 8.0     # 每轮花在"逐线程账单"上的时间上限（秒）
+
+
 class CodexClient:
     def __init__(self):
         self.exe = find_codex_exe()
@@ -234,6 +238,12 @@ class CodexClient:
         self.spawn_lock = threading.Lock()
         self.next_id = 1
         self.last_good = None
+        self.latest = None                 # 后台轮询的最新结果（界面直接读它，不阻塞）
+        self.interval = CODEX_POLL_SECONDS
+        self.thread_budget = CODEX_THREAD_BUDGET
+        self._threads = {}                 # threadId -> (updatedAt, usd_micros)
+        self._stop = threading.Event()
+        self._poller = None
 
     def _spawn(self):
         if not self.exe:
@@ -313,8 +323,11 @@ class CodexClient:
                 self._spawn()
 
     def _fetch(self):
+        """一次完整抓取。
+        账户级接口各要 5~8s（走网络），逐线程账单每条 1~5s，所以线程结果按
+        (threadId, updatedAt) 缓存，并给逐线程那一段设总时间预算。"""
         self._ensure()
-        rl = self._call("account/rateLimits/read", None)
+        rl = self._call("account/rateLimits/read", None, timeout=20)
         if not isinstance(rl, dict):
             return None
         snap = (rl.get("rateLimitsByLimitId") or {}).get("codex") or rl.get("rateLimits") or {}
@@ -325,7 +338,7 @@ class CodexClient:
             "plan": snap.get("planType"),
             "today_tokens": None, "today_usd": None, "model": None, "last_active": None,
         }
-        us = self._call("account/usage/read", {"threadId": None})
+        us = self._call("account/usage/read", {"threadId": None}, timeout=20)
         if isinstance(us, dict):
             key = datetime.date.today().isoformat()
             out["today_tokens"] = 0
@@ -333,10 +346,11 @@ class CodexClient:
                 if b.get("startDate") == key:
                     out["today_tokens"] = int(b.get("tokens") or 0)
                     break
-        tl = self._call("thread/list", {"limit": 15, "sortKey": "updated_at",
+        tl = self._call("thread/list", {"limit": 20, "sortKey": "updated_at",
                                        "sortDirection": "desc"})
         t0 = today_midnight().timestamp()
-        usd, n = 0.0, 0
+        usd, n, missing = 0.0, 0, 0
+        deadline = time.time() + self.thread_budget
         if isinstance(tl, dict):
             items = tl.get("data") or []
             if items:
@@ -349,32 +363,73 @@ class CodexClient:
                     out["last_active"] = ts
                 if not ts or ts < t0:
                     continue
-                u = self._call("account/usage/read", {"threadId": t.get("id")}, timeout=15)
-                tu = (u or {}).get("threadUsage") if isinstance(u, dict) else None
-                if isinstance(tu, dict) and tu.get("estimatedUsageUsdMicros") is not None:
-                    usd += int(tu["estimatedUsageUsdMicros"])
+                tid = t.get("id")
+                hit = self._threads.get(tid)
+                if hit and hit[0] == ts and hit[1] is not None:      # 命中缓存
+                    usd += hit[1]
                     n += 1
+                    continue
+                if time.time() > deadline:                            # 超预算：先用旧值
+                    if hit and hit[1] is not None:
+                        usd += hit[1]
+                        n += 1
+                    else:
+                        missing += 1
+                    continue
+                u = self._call("account/usage/read", {"threadId": tid}, timeout=12)
+                tu = (u or {}).get("threadUsage") if isinstance(u, dict) else None
+                val = None
+                if isinstance(tu, dict) and tu.get("estimatedUsageUsdMicros") is not None:
+                    val = int(tu["estimatedUsageUsdMicros"])
+                self._threads[tid] = (ts, val)
+                if val is not None:
+                    usd += val
+                    n += 1
+                else:
+                    missing += 1
         if n:
             out["today_usd"] = usd / 1_000_000.0
+            out["usd_missing"] = missing
         return out
 
+    # ---- 后台轮询：界面刷新不再被这些慢接口阻塞 ----
+    def start(self):
+        if self._poller is not None:
+            return
+        self._poller = threading.Thread(target=self._loop, name="codex-poll", daemon=True)
+        self._poller.start()
+
+    def _loop(self):
+        while not self._stop.is_set():
+            t0 = time.time()
+            for attempt in (1, 2):
+                try:
+                    r = self._fetch()
+                except Exception:
+                    r = None
+                if r:
+                    self.latest = r
+                    self.last_good = r
+                    break
+                if attempt == 1:
+                    self.close()
+                    time.sleep(0.4)
+            self._stop.wait(max(5.0, self.interval - (time.time() - t0)))
+
     def snapshot(self):
-        for attempt in (1, 2):
-            try:
-                r = self._fetch()
-            except Exception:
-                r = None
-            if r:
-                self.last_good = r
-                return r
-            if attempt == 1:
-                self.close()
-                time.sleep(0.4)
-        return self.last_good
+        """非阻塞：返回后台轮询拿到的最新结果（首轮可能还没拿到）。"""
+        return self.latest
 
 
 _codex = CodexClient()
-atexit.register(_codex.close)
+
+
+def _codex_shutdown():
+    _codex._stop.set()
+    _codex.close()
+
+
+atexit.register(_codex_shutdown)
 
 
 def codex_model_config():
@@ -531,12 +586,38 @@ def collect_all(cfg):
     return {"codex": cx, "dsh": dsh}
 
 
-def led_color(last_ts, running):
+# --------------------------------------------------------------------------- #
+# 状态灯：与刷新节奏同步
+# --------------------------------------------------------------------------- #
+# 判据取"最近"的一个：
+#   1) 指标本身还在变（token / 费用 / 余额 / 配额 任一与上一轮不同）
+#   2) 工具自报的最近活动时间戳还很近（Codex 线程 updatedAt / DSH 会话缓存 mtime）
+# 窗口 = 3 个刷新周期（下限 30s、上限 300s）：刷新调快，灯也跟着更灵敏。
+ACTIVE_FLOOR, ACTIVE_CAP = 60, 300
+_activity = {"prev": {}, "at": {}}
+
+
+def active_window(refresh_seconds):
+    try:
+        n = int(refresh_seconds)
+    except Exception:
+        n = 10
+    return max(ACTIVE_FLOOR, min(ACTIVE_CAP, n * 3))
+
+
+def led_color(key, fingerprint, last_ts, running, window):
     if running is False:
         return C_ERR
-    if not last_ts:
-        return C_OK if running else C_IDLE
-    return C_OK if time.time() - last_ts < 900 else C_IDLE
+    now = time.time()
+    prev = _activity["prev"].get(key)
+    if prev is not None and fingerprint != prev:
+        _activity["at"][key] = now
+    _activity["prev"][key] = fingerprint
+    marks = [_activity["at"].get(key, 0.0)]
+    if last_ts:
+        marks.append(last_ts)
+    t = max(marks)
+    return C_OK if t and (now - t) <= window else C_IDLE
 
 
 # --------------------------------------------------------------------------- #
@@ -638,6 +719,7 @@ class Pet:
         self._place_self()
         self._bind()
         self._start_tray()
+        _codex.start()                  # Codex 侧后台轮询，界面刷新不再等它
         if not self.cfg.get("visible", True):
             root.withdraw()
         self.refresh()
@@ -836,7 +918,7 @@ class Pet:
 
     def quit(self):
         log("quit")
-        _codex.close()
+        _codex_shutdown()
         try:
             if self.tray:
                 self.tray.stop()
@@ -899,16 +981,30 @@ class Pet:
                 f"{money(cx.get('cost'), self.cfg['pricing']['codex']['currency'])}",
                 self.F_NAME, self.F_MODEL, self.F_MAIN, self.F_RIGHT)
             bal = ds.get("balance")
+            if bal:
+                total = float(bal.get("balance") or 0) + float(bal.get("bonus") or 0)
+                bal_txt = f"余额 ¥{total:.2f}"
+            else:
+                total, bal_txt = None, "余额 —"
             b = self._prepare(
                 "DeepSeek", short_model("DeepSeek", ds.get("model") or "") if show_model else "",
-                f"余额 ¥{bal['balance']:.2f}" if bal else "余额 —",
+                bal_txt,
                 f"{fmt_num(ds.get('total_tokens', 0))} tok · "
                 f"{money(ds.get('cost'), self.cfg['pricing']['dsh']['currency'])}",
                 self.F_NAME_CJK, self.F_MODEL, self.F_CJK, self.F_RIGHT)
-            led_a = led_color(cx.get("last_active"), cx.get("running"))
-            led_b = led_color(ds.get("last_active"), ds.get("running"))
+            win = active_window(self.cfg.get("refresh_seconds", 10))
+            led_a = led_color(
+                "codex",
+                (cx.get("today_tokens"), cx.get("cost"), p, s, cx.get("model"),
+                 cx.get("running")),
+                cx.get("last_active"), cx.get("running"), win)
+            led_b = led_color(
+                "dsh",
+                (ds.get("total_tokens"), round(float(ds.get("cost") or 0), 6), total,
+                 ds.get("running")),
+                ds.get("last_active"), ds.get("running"), win)
             warn_a = isinstance(p, (int, float)) and p >= 90
-            warn_b = not bal
+            warn_b = bal is None
         else:
             a = self._prepare("Codex", "", "读取中…", "", self.F_NAME, self.F_MODEL,
                               self.F_MAIN, self.F_RIGHT)
