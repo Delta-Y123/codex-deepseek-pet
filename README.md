@@ -1,7 +1,7 @@
 # Codex + DeepSeek Harness 桌面宠物
 
 一个 Windows 悬浮小挂件：把 **OpenAI Codex** 和 **DeepSeek Harness** 两个 AI 编程工具
-的用量、额度和花费并排放在桌面右下角，两行、透明背景、几乎不占地方。
+的用量、额度和花费并排放在屏幕指定角落，两行、透明背景、几乎不占地方。
 
 ![预览](preview.png)
 
